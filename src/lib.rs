@@ -5,8 +5,8 @@ use std::{cell::RefCell, fmt, sync::{Arc, RwLock}};
 use serde::{de::{SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeStruct;
 
-const _PAGE_SIZE: usize = 4096;
-const _TABLE_MAX_PAGES: usize = 100;
+const PAGE_SIZE: usize = 4096;
+const TABLE_MAX_PAGES: usize = 100;
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -51,15 +51,10 @@ impl Table {
     }
 
     fn get_row(&self, row_num: usize) -> Option<Row> {
-        let pages = self.pages.read().unwrap();
-        let mut row_num = row_num;
-        for page in pages.iter() {
-            if row_num < page.count {
-                return page.get_row(row_num);
-            }
-            row_num -= page.count;
-        }
-        None
+        let page_num = row_num / PAGE_SIZE;
+        let row_num = row_num % PAGE_SIZE;
+        let page = self.get_page(page_num)?;
+        page.get_row(row_num)
     }
 }
 
@@ -216,11 +211,37 @@ mod tests {
         let page = table.get_page(0).unwrap();
         page.insert_row(Row {
             id: 1,
-            name: "test".to_string(),
+            name: "test1".to_string(),
         });
-        let row = page.get_row(0).unwrap();
-        assert_eq!(row.id, 1);
-        assert_eq!(row.name, "test");
+        page.insert_row(Row {
+            id: 2,
+            name: "test2".to_string(),
+        });
+        let row = page.get_row(1).unwrap();
+        assert_eq!(row.id, 2);
+        assert_eq!(row.name, "test2");
+    }
+
+    #[test]
+    fn test_inserting_2000_rows() {
+        let table = Table::new();
+        table.add_page();
+        for i in 0..2000 {
+            table.insert_row(Row {
+                id: i as i32,
+                name: format!("test{}", i),
+            });
+        }
+        for i in 0..2000 {
+            let row = table.get_row(i);
+            if let Some(row) = row {
+                assert_eq!(row.id, i as i32);
+                assert_eq!(row.name, format!("test{}", i));
+            } else {
+                eprintln!("Row id {} not found", i);
+                assert!(false);
+            }
+        }
     }
 
 
