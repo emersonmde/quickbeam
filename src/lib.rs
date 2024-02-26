@@ -1,12 +1,14 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_variables)]
 #![feature(test)]
 
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
 
 const PAGE_SIZE: usize = 4096;
-const TABLE_MAX_PAGES: usize = 100;
+const ROWS_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<Row>();
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Row {
@@ -14,197 +16,134 @@ struct Row {
     name: String,
 }
 
-type PageLock = Option<Arc<RwLock<Page>>>;
-type PageVec = Vec<PageLock>;
-type TablePagesLock = Arc<RwLock<PageVec>>;
-
 #[derive(Debug, Clone)]
-struct Table {
-    pages: TablePagesLock,
-    num_rows: usize,
-}
-
-impl Table {
-    fn new() -> Self {
-        let pages = Arc::new(RwLock::new(Vec::new()));
-        Table { pages, num_rows: 0 }
-    }
-
-    fn add_page(&self) {
-        let mut pages = self.pages.write().unwrap();
-        pages.push(Option::Some(Arc::new(RwLock::new(Page {
-            count: 0,
-            rows: Vec::new(),
-        }))));
-    }
-
-    fn get_page(&self, page_num: usize) -> Option<Arc<RwLock<Page>>> {
-        let pages = self.pages.read().unwrap();
-        pages.get(page_num).cloned()?
-    }
-
-    fn insert_row(&mut self, row: Row) -> Result<(), std::io::Error> {
-        let page_num = self.num_rows / PAGE_SIZE;
-        let row_num_in_page = self.num_rows % PAGE_SIZE;
-
-        let pages_read_lock = self.pages.read().unwrap();
-        let page_arc = if page_num < pages_read_lock.len() {
-            // Page exists, clone Arc for later write access
-            pages_read_lock[page_num].clone()
-        } else {
-            // Convert to write lock
-            drop(pages_read_lock);
-            let mut pages_write_lock = self.pages.write().unwrap();
-
-            // Double check page wasn't already added
-            if page_num >= pages_write_lock.len() {
-                pages_write_lock.push(Some(Arc::new(RwLock::new(Page::new()))));
-            }
-            pages_write_lock[page_num].clone()
-        };
-
-        if let Some(page) = page_arc {
-            let mut page_lock = page.write().unwrap();
-            if row_num_in_page < PAGE_SIZE {
-                page_lock.rows.push(row);
-                self.num_rows += 1;
-            } else {
-                // TODO: Implement splitting pages
-            }
-        }
-
-        Ok(())
-    }
-
-    fn get_row(&self, row_num: usize) -> Option<Row> {
-        let page_num = row_num / PAGE_SIZE;
-        let row_num = row_num % PAGE_SIZE;
-        let page_lock = self.get_page(page_num)?;
-        let page = page_lock.read().unwrap();
-        page.get_row(row_num)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Page {
-    count: usize,
     rows: Vec<Row>,
 }
 
 impl Page {
     fn new() -> Self {
-        Page {
-            count: 0,
-            rows: Vec::new(),
+        Page { rows: Vec::new() }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut rows = Vec::new();
+        for chunk in bytes.chunks_exact(std::mem::size_of::<Row>()) {
+            let row: Row = bincode::deserialize(chunk).unwrap();
+            rows.push(row);
         }
-    }
-
-    fn insert_row(&mut self, row: Row) {
-        let rows = &mut self.rows;
-        self.count += 1;
-        rows.push(row);
-    }
-
-    fn get_row(&self, row_num: usize) -> Option<Row> {
-        let rows = &self.rows;
-        rows.get(row_num).cloned()
+        Page { rows }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    extern crate test;
+type PageLock = Arc<RwLock<Page>>;
 
-    #[test]
-    fn test_table() {
-        let table = Table::new();
-        assert_eq!(table.num_rows, 0);
+#[derive(Debug)]
+struct Pager {
+    pages: Arc<RwLock<HashMap<usize, PageLock>>>,
+    file: File,
+}
+
+impl Pager {
+    fn new() -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open("data.db")?;
+        Ok(Pager {
+            pages: Arc::new(RwLock::new(HashMap::new())),
+            file,
+        })
     }
 
-    #[test]
-    fn test_insert_and_retrieve() {
-        let mut table = Table::new();
-        let _ = table.insert_row(Row {
-            id: 1,
-            name: "test".to_string(),
-        });
-        let row = table.get_row(0).unwrap();
-        assert_eq!(row.id, 1);
-        assert_eq!(row.name, "test");
+    fn get_page(&mut self, page_num: usize) -> io::Result<PageLock> {
+        // TODO: Stop pager from requiring write locks
+        let mut pages = self.pages.write().unwrap();
+        let page = pages
+            .entry(page_num)
+            .or_insert_with(|| {
+                // Seek to the start of the page
+                let offset = (page_num * PAGE_SIZE) as u64;
+                self.file
+                    .seek(SeekFrom::Start(offset))
+                    .expect("Failed to seek in file");
+
+                // Read the page data
+                let mut buffer = vec![0; PAGE_SIZE];
+                self.file
+                    .read_exact(&mut buffer)
+                    .expect("Failed to read page data");
+
+                // Create a new Page from the buffer
+                Arc::new(RwLock::new(Page::from_bytes(&buffer)))
+            })
+            .clone();
+        Ok(page)
     }
 
-    #[test]
-    fn test_inserting_100000_rows() {
-        let mut table = Table::new();
-        for i in 0..100_000 {
-            table
-                .insert_row(Row {
-                    id: i,
-                    name: format!("test{}", i),
-                })
-                .unwrap();
+    fn find(&self, key: i32) -> Option<usize> {
+        todo!("Implement BTree Search");
+    }
+}
+
+#[derive(Debug)]
+struct Table {
+    pager: Pager,
+}
+
+impl Table {
+    fn new() -> Self {
+        Table {
+            pager: Pager::new().expect("Error opening database file"),
         }
-        for i in 0..100_000 {
-            let row = table.get_row(i).unwrap();
-            assert_eq!(row.id, i.try_into().unwrap());
-            assert_eq!(row.name, format!("test{}", i));
-        }
-        assert_eq!(table.num_rows, 100_000);
+    }
+}
+
+struct Cursor {
+    pager: Arc<RwLock<Pager>>,
+    current_page: Option<PageLock>,
+    row_num: usize,
+    end_of_table: bool,
+}
+
+impl Cursor {
+    fn new(pager: Arc<RwLock<Pager>>, row_num: usize) -> Result<Self, io::Error> {
+        let page_num = row_num / ROWS_PER_PAGE;
+        // TODO: Stop pager from requiring write locks
+        let mut pager_lock = pager.write().unwrap();
+        let get_page = pager_lock.get_page(page_num)?;
+        let current_page = Some(get_page);
+
+        Ok(Cursor {
+            pager: pager.clone(),
+            current_page,
+            row_num,
+            end_of_table: false,
+        })
     }
 
-    #[test]
-    fn test_serializing_and_deserializing_pages() {
-        let mut page = Page::new();
-        page.insert_row(Row {
-            id: 1,
-            name: "test".to_string(),
-        });
-        page.insert_row(Row {
-            id: 2,
-            name: "test2".to_string(),
-        });
-        page.insert_row(Row {
-            id: 3,
-            name: "test3".to_string(),
-        });
-        let serialized = bincode::serialize(&page).unwrap();
-        let deserialized: Page = bincode::deserialize(&serialized).unwrap();
-        assert_eq!(page, deserialized);
-    }
+    fn advance(&mut self) {
+        self.row_num += 1;
+        let new_page_num = self.row_num / ROWS_PER_PAGE;
 
-    #[bench]
-    fn bench_inserting_1000_rows(b: &mut test::Bencher) {
-        let mut table = Table::new();
-        b.iter(|| {
-            for i in 0..1000 {
-                table
-                    .insert_row(Row {
-                        id: i,
-                        name: format!("test{}", i),
-                    })
-                    .unwrap();
+        if let Some(page_lock) = &self.current_page {
+            let page = page_lock.read().unwrap();
+            if self.row_num >= page.rows.len() * (new_page_num + 1) {
+                self.end_of_table = true;
+                return;
             }
-        });
-    }
-
-    #[bench]
-    fn bench_retrieving_1000_rows(b: &mut test::Bencher) {
-        let mut table = Table::new();
-        for i in 0..1000 {
-            table
-                .insert_row(Row {
-                    id: i,
-                    name: format!("test{}", i),
-                })
-                .unwrap();
         }
-        b.iter(|| {
-            for i in 0..1000 {
-                let row = table.get_row(i).unwrap();
-                assert_eq!(row.id, i.try_into().unwrap());
-                assert_eq!(row.name, format!("test{}", i));
-            }
-        });
+
+        if new_page_num != self.row_num / ROWS_PER_PAGE {
+            // TODO: Stop pager from requiring write locks
+            let mut pager_lock = self.pager.write().unwrap();
+            self.current_page = Some(
+                pager_lock
+                    .get_page(new_page_num)
+                    .expect("Failed to get page"),
+            );
+        }
     }
 }
