@@ -1,256 +1,210 @@
 #![allow(dead_code)]
+#![feature(test)]
 
-use std::{cell::RefCell, fmt, sync::{Arc, RwLock}};
-
-use serde::{de::{SeqAccess, Visitor}, Deserialize, Deserializer, Serialize, Serializer};
-use serde::ser::SerializeStruct;
+use serde::Deserialize;
+use serde::Serialize;
+use std::sync::{Arc, RwLock};
 
 const PAGE_SIZE: usize = 4096;
 const TABLE_MAX_PAGES: usize = 100;
 
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Row {
     id: i32,
     name: String,
 }
 
+type PageLock = Option<Arc<RwLock<Page>>>;
+type PageVec = Vec<PageLock>;
+type TablePagesLock = Arc<RwLock<PageVec>>;
 
 #[derive(Debug, Clone)]
 struct Table {
-    pages: Arc<RwLock<Vec<Page>>>,
+    pages: TablePagesLock,
     num_rows: usize,
 }
 
 impl Table {
     fn new() -> Self {
         let pages = Arc::new(RwLock::new(Vec::new()));
-        Table {
-            pages,
-            num_rows: 0,
-        }
+        Table { pages, num_rows: 0 }
     }
 
     fn add_page(&self) {
         let mut pages = self.pages.write().unwrap();
-        pages.push(Page {
+        pages.push(Option::Some(Arc::new(RwLock::new(Page {
             count: 0,
-            rows: RefCell::new(Vec::new()),
-        });
+            rows: Vec::new(),
+        }))));
     }
 
-    fn get_page(&self, page_num: usize) -> Option<Page> {
+    fn get_page(&self, page_num: usize) -> Option<Arc<RwLock<Page>>> {
         let pages = self.pages.read().unwrap();
-        pages.get(page_num).cloned()
+        pages.get(page_num).cloned()?
     }
 
-    fn insert_row(&self, row: Row) {
-        let pages = self.pages.write().unwrap();
-        let last_page = pages.last().unwrap();
-        last_page.insert_row(row);
+    fn insert_row(&mut self, row: Row) -> Result<(), std::io::Error> {
+        let page_num = self.num_rows / PAGE_SIZE;
+        let row_num_in_page = self.num_rows % PAGE_SIZE;
+
+        let pages_read_lock = self.pages.read().unwrap();
+        let page_arc = if page_num < pages_read_lock.len() {
+            // Page exists, clone Arc for later write access
+            pages_read_lock[page_num].clone()
+        } else {
+            // Convert to write lock
+            drop(pages_read_lock);
+            let mut pages_write_lock = self.pages.write().unwrap();
+
+            // Double check page wasn't already added
+            if page_num >= pages_write_lock.len() {
+                pages_write_lock.push(Some(Arc::new(RwLock::new(Page::new()))));
+            }
+            pages_write_lock[page_num].clone()
+        };
+
+        if let Some(page) = page_arc {
+            let mut page_lock = page.write().unwrap();
+            if row_num_in_page < PAGE_SIZE {
+                page_lock.rows.push(row);
+                self.num_rows += 1;
+            } else {
+                // TODO: Implement splitting pages
+            }
+        }
+
+        Ok(())
     }
 
     fn get_row(&self, row_num: usize) -> Option<Row> {
         let page_num = row_num / PAGE_SIZE;
         let row_num = row_num % PAGE_SIZE;
-        let page = self.get_page(page_num)?;
+        let page_lock = self.get_page(page_num)?;
+        let page = page_lock.read().unwrap();
         page.get_row(row_num)
     }
 }
 
-impl Serialize for Table {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let pages = self.pages.read().unwrap();
-        let mut ser = serializer.serialize_struct("Table", 2)?;
-        ser.serialize_field("pages", &*pages)?;
-        ser.serialize_field("num_rows", &self.num_rows)?;
-        ser.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Table {
-    fn deserialize<D>(deserializer: D) -> Result<Table, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct TableVisitor;
-
-        impl<'de> Visitor<'de> for TableVisitor {
-            type Value = Table;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct Table")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> Result<Table, V::Error>
-            where
-                V: serde::de::MapAccess<'de>,
-            {
-                let mut pages: Vec<Page> = Vec::new();
-                let mut num_rows: usize = 0;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        "pages" => {
-                            pages = map.next_value()?;
-                        }
-                        "num_rows" => {
-                            num_rows = map.next_value()?;
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Table {
-                    pages: Arc::new(RwLock::new(pages)),
-                    num_rows,
-                })
-            }
-        }
-
-        deserializer.deserialize_struct("Table", &["pages", "num_rows"], TableVisitor)
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Page {
     count: usize,
-    rows: RefCell<Vec<Row>>,
+    rows: Vec<Row>,
 }
 
 impl Page {
     fn new() -> Self {
         Page {
             count: 0,
-            rows: RefCell::new(Vec::new()),
+            rows: Vec::new(),
         }
     }
 
-    fn insert_row(&self, row: Row) {
-        let mut rows = self.rows.borrow_mut();
+    fn insert_row(&mut self, row: Row) {
+        let rows = &mut self.rows;
+        self.count += 1;
         rows.push(row);
     }
 
     fn get_row(&self, row_num: usize) -> Option<Row> {
-        let rows = self.rows.borrow();
+        let rows = &self.rows;
         rows.get(row_num).cloned()
-    }
-}
-
-
-impl Serialize for Page {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let rows = self.rows.borrow();
-        let mut state = serializer.serialize_struct("Page", 1)?;
-        state.serialize_field("rows", &*rows)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Page {
-    fn deserialize<D>(deserializer: D) -> Result<Page, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct PageVisitor;
-
-        impl<'de> Visitor<'de> for PageVisitor {
-            type Value = Page;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("struct Page")
-            }
-
-            fn visit_seq<V>(self, mut seq: V) -> Result<Page, V::Error>
-            where
-                V: SeqAccess<'de>,
-            {
-                let rows: Vec<Row> = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                Ok(Page {
-                    count: rows.len(),
-                    rows: RefCell::new(rows),
-                })
-            }
-        }
-        
-        deserializer.deserialize_seq(PageVisitor)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn it_works() {
-        assert_eq!(true, true);
-    }
+    extern crate test;
 
     #[test]
     fn test_table() {
         let table = Table::new();
-        table.add_page();
-        let page = table.get_page(0).unwrap();
-        page.insert_row(Row {
+        assert_eq!(table.num_rows, 0);
+    }
+
+    #[test]
+    fn test_insert_and_retrieve() {
+        let mut table = Table::new();
+        let _ = table.insert_row(Row {
             id: 1,
             name: "test".to_string(),
         });
-        let row = page.get_row(0).unwrap();
+        let row = table.get_row(0).unwrap();
         assert_eq!(row.id, 1);
         assert_eq!(row.name, "test");
     }
 
     #[test]
-    fn test_insert_and_retrieve() {
-        let table = Table::new();
-        table.add_page();
-        let page = table.get_page(0).unwrap();
+    fn test_inserting_100000_rows() {
+        let mut table = Table::new();
+        for i in 0..100_000 {
+            table
+                .insert_row(Row {
+                    id: i,
+                    name: format!("test{}", i),
+                })
+                .unwrap();
+        }
+        for i in 0..100_000 {
+            let row = table.get_row(i).unwrap();
+            assert_eq!(row.id, i.try_into().unwrap());
+            assert_eq!(row.name, format!("test{}", i));
+        }
+        assert_eq!(table.num_rows, 100_000);
+    }
+
+    #[test]
+    fn test_serializing_and_deserializing_pages() {
+        let mut page = Page::new();
         page.insert_row(Row {
             id: 1,
-            name: "test1".to_string(),
+            name: "test".to_string(),
         });
         page.insert_row(Row {
             id: 2,
             name: "test2".to_string(),
         });
-        let row = page.get_row(1).unwrap();
-        assert_eq!(row.id, 2);
-        assert_eq!(row.name, "test2");
+        page.insert_row(Row {
+            id: 3,
+            name: "test3".to_string(),
+        });
+        let serialized = bincode::serialize(&page).unwrap();
+        let deserialized: Page = bincode::deserialize(&serialized).unwrap();
+        assert_eq!(page, deserialized);
     }
 
-    #[test]
-    fn test_inserting_2000_rows() {
-        let table = Table::new();
-        table.add_page();
-        for i in 0..2000 {
-            table.insert_row(Row {
-                id: i as i32,
-                name: format!("test{}", i),
-            });
-        }
-        for i in 0..2000 {
-            let row = table.get_row(i);
-            if let Some(row) = row {
-                assert_eq!(row.id, i as i32);
-                assert_eq!(row.name, format!("test{}", i));
-            } else {
-                eprintln!("Row id {} not found", i);
-                assert!(false);
+    #[bench]
+    fn bench_inserting_1000_rows(b: &mut test::Bencher) {
+        let mut table = Table::new();
+        b.iter(|| {
+            for i in 0..1000 {
+                table
+                    .insert_row(Row {
+                        id: i,
+                        name: format!("test{}", i),
+                    })
+                    .unwrap();
             }
-        }
+        });
     }
 
-
-
-
-
-
-
-
-
-
+    #[bench]
+    fn bench_retrieving_1000_rows(b: &mut test::Bencher) {
+        let mut table = Table::new();
+        for i in 0..1000 {
+            table
+                .insert_row(Row {
+                    id: i,
+                    name: format!("test{}", i),
+                })
+                .unwrap();
+        }
+        b.iter(|| {
+            for i in 0..1000 {
+                let row = table.get_row(i).unwrap();
+                assert_eq!(row.id, i.try_into().unwrap());
+                assert_eq!(row.name, format!("test{}", i));
+            }
+        });
+    }
 }
