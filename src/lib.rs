@@ -10,19 +10,10 @@ use std::sync::{Arc, RwLock};
 const PAGE_SIZE: usize = 4096;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<Row>();
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 struct Row {
     id: i32,
     name: String,
-}
-
-impl Default for Row {
-    fn default() -> Self {
-        Row {
-            id: 0,
-            name: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
