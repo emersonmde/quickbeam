@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, RwLock};
 
@@ -38,49 +38,45 @@ impl Page {
 
 type PageLock = Arc<RwLock<Page>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Pager {
     pages: Arc<RwLock<HashMap<usize, PageLock>>>,
-    file: File,
 }
 
 impl Pager {
     fn new() -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open("data.db")?;
         Ok(Pager {
             pages: Arc::new(RwLock::new(HashMap::new())),
-            file,
         })
     }
 
-    fn get_page(&mut self, page_num: usize) -> io::Result<PageLock> {
+    fn get_page(&self, page_num: usize) -> io::Result<PageLock> {
         // TODO: Stop pager from requiring write locks
-        let mut pages = self.pages.write().unwrap();
-        let page = pages
-            .entry(page_num)
-            .or_insert_with(|| {
-                // Seek to the start of the page
-                let offset = (page_num * PAGE_SIZE) as u64;
-                self.file
-                    .seek(SeekFrom::Start(offset))
-                    .expect("Failed to seek in file");
+        let pages = self.pages.read().unwrap();
+        if let Some(page) = pages.get(&page_num) {
+            Ok(page.clone())
+        } else {
+            drop(pages);
 
-                // Read the page data
-                let mut buffer = vec![0; PAGE_SIZE];
-                self.file
-                    .read_exact(&mut buffer)
-                    .expect("Failed to read page data");
+            let offset = (page_num * PAGE_SIZE) as u64;
+            let mut buffer = vec![0; PAGE_SIZE];
 
-                // Create a new Page from the buffer
-                Arc::new(RwLock::new(Page::from_bytes(&buffer)))
-            })
-            .clone();
-        Ok(page)
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open("data.db")?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buffer)?;
+            drop(file);
+
+            let page_lock = Arc::new(RwLock::new(Page::from_bytes(&buffer)));
+
+            let mut pages = self.pages.write().unwrap();
+            pages.insert(page_num, page_lock.clone());
+            Ok(page_lock)
+        }
     }
 
     fn find(&self, key: i32) -> Option<usize> {
@@ -102,22 +98,20 @@ impl Table {
 }
 
 struct Cursor {
-    pager: Arc<RwLock<Pager>>,
+    pager: Box<Pager>,
     current_page: Option<PageLock>,
     row_num: usize,
     end_of_table: bool,
 }
 
 impl Cursor {
-    fn new(pager: Arc<RwLock<Pager>>, row_num: usize) -> Result<Self, io::Error> {
+    fn new(pager: Box<Pager>, row_num: usize) -> Result<Self, io::Error> {
         let page_num = row_num / ROWS_PER_PAGE;
-        // TODO: Stop pager from requiring write locks
-        let mut pager_lock = pager.write().unwrap();
-        let get_page = pager_lock.get_page(page_num)?;
+        let get_page = pager.get_page(page_num)?;
         let current_page = Some(get_page);
 
         Ok(Cursor {
-            pager: pager.clone(),
+            pager,
             current_page,
             row_num,
             end_of_table: false,
@@ -137,10 +131,8 @@ impl Cursor {
         }
 
         if new_page_num != self.row_num / ROWS_PER_PAGE {
-            // TODO: Stop pager from requiring write locks
-            let mut pager_lock = self.pager.write().unwrap();
             self.current_page = Some(
-                pager_lock
+                self.pager
                     .get_page(new_page_num)
                     .expect("Failed to get page"),
             );
