@@ -16,6 +16,15 @@ struct Row {
     name: String,
 }
 
+impl Default for Row {
+    fn default() -> Self {
+        Row {
+            id: 0,
+            name: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Page {
     rows: Vec<Row>,
@@ -100,7 +109,15 @@ impl Pager {
     fn insert_row_at(&self, page_num: usize, row_num: usize, row: Row) -> io::Result<()> {
         let page = self.get_page(page_num)?;
         let mut page = page.write().unwrap();
-        page.rows.insert(row_num, row);
+
+        let index_within_page = row_num % ROWS_PER_PAGE;
+
+        if index_within_page >= page.rows.len() {
+            page.rows.resize_with(index_within_page + 1, Row::default);
+        }
+
+        page.rows[index_within_page] = row;
+        eprintln!("Inserting row at page {}, row {}", page_num, row_num);
         Ok(())
     }
 
@@ -265,6 +282,26 @@ mod tests {
         cursor.insert(test_row.clone());
         let retrieved_row = cursor.pager.get_row_at(0, 0)?;
         assert_eq!(test_row, retrieved_row);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_after_cursor_insert_5_records() -> io::Result<()> {
+        let pager = Pager::new()?;
+        let mut cursor = Cursor::new(Box::new(pager), 0)?;
+        let test_row = Row {
+            id: 1,
+            name: "test".to_string(),
+        };
+        for i in 0..50000 {
+            cursor.insert(Row {
+                id: i,
+                name: "test".to_string(),
+            });
+            cursor.advance();
+        }
+        let found_row = cursor.pager.find(1);
+        assert_eq!(Some(test_row), found_row);
         Ok(())
     }
 
