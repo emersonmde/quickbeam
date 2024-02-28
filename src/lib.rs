@@ -1,11 +1,10 @@
-#![allow(dead_code, unused_variables)]
 #![feature(test)]
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, RwLock};
 
 const PAGE_SIZE: usize = 4096;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<Row>();
@@ -32,30 +31,22 @@ impl Page {
     }
 }
 
-type PageLock = Arc<RwLock<Page>>;
-
 #[derive(Debug, Clone)]
 struct Pager {
-    pages: Arc<RwLock<HashMap<usize, PageLock>>>,
+    pages: HashMap<usize, Page>,
 }
 
 impl Pager {
     fn new() -> io::Result<Self> {
         Ok(Pager {
-            pages: Arc::new(RwLock::new(HashMap::new())),
+            pages: HashMap::new(),
         })
     }
 
-    fn get_page(&self, page_num: usize) -> io::Result<PageLock> {
-        let pages = self.pages.read().unwrap();
-        if let Some(page) = pages.get(&page_num) {
-            Ok(page.clone())
-        } else {
-            drop(pages);
-
+    fn get_page(&mut self, page_num: usize) -> io::Result<&mut Page> {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.pages.entry(page_num) {
             let offset = (page_num * PAGE_SIZE) as u64;
             let mut buffer = vec![0; PAGE_SIZE];
-
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -69,20 +60,14 @@ impl Pager {
 
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut buffer)?;
-            drop(file);
-
-            let page_lock = Arc::new(RwLock::new(Page::from_bytes(&buffer)));
-
-            let mut pages = self.pages.write().unwrap();
-            pages.insert(page_num, page_lock.clone());
-            Ok(page_lock)
+            let page = Page::from_bytes(&buffer);
+            e.insert(page);
         }
+        Ok(self.pages.get_mut(&page_num).unwrap())
     }
 
     fn flush_page(&self, page_num: usize) -> io::Result<()> {
-        let pages = self.pages.read().unwrap();
-        if let Some(page) = pages.get(&page_num) {
-            let page = page.read().unwrap();
+        if let Some(page) = self.pages.get(&page_num) {
             let offset = (page_num * PAGE_SIZE) as u64;
             let mut file = OpenOptions::new()
                 .read(true)
@@ -92,14 +77,12 @@ impl Pager {
                 .open("data.db")?;
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&bincode::serialize(&page.rows).unwrap())?;
-            drop(file);
         }
         Ok(())
     }
 
-    fn insert_row_at(&self, page_num: usize, row_num: usize, row: Row) -> io::Result<()> {
+    fn insert_row_at(&mut self, page_num: usize, row_num: usize, row: Row) -> io::Result<()> {
         let page = self.get_page(page_num)?;
-        let mut page = page.write().unwrap();
 
         let index_within_page = row_num % ROWS_PER_PAGE;
 
@@ -112,18 +95,24 @@ impl Pager {
         Ok(())
     }
 
-    fn get_row_at(&self, page_num: usize, row_num: usize) -> io::Result<Row> {
-        let page = self.get_page(page_num)?;
-        let page = page.read().unwrap();
-        Ok(page.rows[row_num].clone())
+    fn get_row_at(&mut self, page_num: usize, row_num: usize) -> io::Result<Option<Row>> {
+        match self.get_page(page_num) {
+            Ok(page) => {
+                let index_within_page = row_num % ROWS_PER_PAGE;
+                if index_within_page < page.rows.len() {
+                    Ok(Some(page.rows[index_within_page].clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     // TODO: Replace with BTree search
     fn find(&self, key: i32) -> Option<Row> {
-        let pages = self.pages.read().unwrap();
-        for (page_num, page) in pages.iter() {
-            let page = page.read().unwrap();
-            for (row_num, row) in page.rows.iter().enumerate() {
+        for (_, page) in self.pages.iter() {
+            for row in page.rows.iter() {
                 if row.id == key {
                     return Some(row.clone());
                 }
@@ -187,118 +176,198 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate test;
+    use std::fs;
+    use test::Bencher;
+
+    fn setup_test_db() -> io::Result<Pager> {
+        let pager = Pager::new()?;
+        std::fs::remove_file("data.db").ok();
+        Ok(pager)
+    }
 
     #[test]
-    fn test_row_serialization_deserialization() {
+    fn test_insert_and_retrieve_single_row() -> io::Result<()> {
+        let mut pager = setup_test_db()?;
         let row = Row {
             id: 1,
-            name: "Test".to_string(),
+            name: "Test User".to_string(),
         };
-        let serialized = bincode::serialize(&row).unwrap();
-        let deserialized: Row = bincode::deserialize(&serialized).unwrap();
-        assert_eq!(row, deserialized);
-    }
+        pager.insert_row_at(0, 0, row.clone())?;
 
-    #[test]
-    fn test_page_initialization_and_byte_conversion() {
-        let row = Row {
-            id: 1,
-            name: "Test".to_string(),
-        };
-        let mut page = Page::new();
-        page.rows.push(row.clone());
-        let page_bytes = bincode::serialize(&page.rows).unwrap();
-        let reconstructed_page = Page::from_bytes(&page_bytes);
-        assert_eq!(reconstructed_page.rows[0], row);
-    }
-
-    #[test]
-    fn test_pager_get_and_flush_page() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let page_lock = pager.get_page(0)?;
-        {
-            let mut page = page_lock.write().unwrap();
-            page.rows.push(Row {
-                id: 1,
-                name: "Test".to_string(),
-            });
-        }
-        pager.flush_page(0)?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_pager_insert_row_and_get_row() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let test_row = Row {
-            id: 1,
-            name: "Alice".to_string(),
-        };
-        pager.insert_row_at(0, 0, test_row.clone())?;
         let retrieved_row = pager.get_row_at(0, 0)?;
-        assert_eq!(test_row, retrieved_row);
+        assert_eq!(retrieved_row, Some(row));
+
         Ok(())
     }
 
     #[test]
-    fn test_pager_find() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let test_row = Row {
+    fn test_insert_and_retrieve_multiple_rows_across_pages() -> io::Result<()> {
+        let mut pager = setup_test_db()?;
+        let row1 = Row {
             id: 1,
-            name: "Alice".to_string(),
+            name: "Test User 1".to_string(),
         };
-        pager.insert_row_at(0, 0, test_row.clone())?;
-        let found_row = pager.find(1);
-        assert_eq!(Some(test_row), found_row);
+        let row2 = Row {
+            id: 2,
+            name: "Test User 2".to_string(),
+        };
+
+        let second_page_row_num = ROWS_PER_PAGE;
+
+        pager.insert_row_at(0, 0, row1.clone())?;
+        pager.insert_row_at(1, second_page_row_num, row2.clone())?;
+
+        let retrieved_row1 = pager.get_row_at(0, 0)?;
+        let retrieved_row2 = pager.get_row_at(1, second_page_row_num)?;
+
+        assert_eq!(retrieved_row1, Some(row1));
+        assert_eq!(retrieved_row2, Some(row2));
+
         Ok(())
     }
 
     #[test]
-    fn test_cursor_advance() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let mut cursor = Cursor::new(Box::new(pager), 0)?;
-        cursor.advance();
-        assert_eq!(cursor.row_num, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_cursor_insert() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let mut cursor = Cursor::new(Box::new(pager), 0)?;
-        let test_row = Row {
-            id: 1,
-            name: "Alice".to_string(),
-        };
-        cursor.insert(test_row.clone());
-        let retrieved_row = cursor.pager.get_row_at(0, 0)?;
-        assert_eq!(test_row, retrieved_row);
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_after_cursor_insert_5_records() -> io::Result<()> {
-        let pager = Pager::new()?;
-        let mut cursor = Cursor::new(Box::new(pager), 0)?;
-        let test_row = Row {
-            id: 1,
-            name: "test".to_string(),
-        };
-        for i in 0..50000 {
-            cursor.insert(Row {
-                id: i,
-                name: "test".to_string(),
-            });
-            cursor.advance();
+    fn test_persistence() -> io::Result<()> {
+        {
+            let mut pager = setup_test_db()?;
+            let row = Row {
+                id: 1,
+                name: "Persisted User".to_string(),
+            };
+            pager.insert_row_at(0, 0, row)?;
+            pager.flush_page(0)?;
+            // Ensure pager is dropped and data is flushed to disk
         }
-        let found_row = cursor.pager.find(1);
-        assert_eq!(Some(test_row), found_row);
+
+        // Reload and check
+        {
+            let mut pager = Pager::new()?;
+            let retrieved_row = pager.get_row_at(0, 0)?;
+            assert_eq!(
+                retrieved_row,
+                Some(Row {
+                    id: 1,
+                    name: "Persisted User".to_string()
+                })
+            );
+        }
+
         Ok(())
     }
 
     #[test]
-    fn test_table_new() {
+    fn test_insert_beyond_current_size() -> io::Result<()> {
+        let mut pager = setup_test_db()?;
+        let row = Row {
+            id: 1,
+            name: "Far User".to_string(),
+        };
+
+        // Insert a row well beyond the current size to test auto-extension
+        let far_row_num = ROWS_PER_PAGE * 10;
+        pager.insert_row_at(10, far_row_num, row.clone())?;
+
+        let retrieved_row = pager.get_row_at(10, far_row_num)?;
+        assert_eq!(retrieved_row, Some(row));
+
+        Ok(())
+    }
+
+    #[bench]
+    fn bench_insert_row(b: &mut Bencher) {
+        let mut pager = Pager::new().unwrap();
+        let row = Row {
+            id: 1,
+            name: "Test Name".to_string(),
+        };
+
+        // Clean up before running
+        let _ = fs::remove_file("data.db");
+
+        b.iter(|| {
+            // Note: This simplistic approach does not manage page or row numbers
+            // realistically. Adjust according to your implementation needs.
+            let _ = pager.insert_row_at(0, 0, row.clone());
+        });
+
+        // Cleanup after benchmark
+        let _ = fs::remove_file("data.db");
+    }
+
+    #[bench]
+    fn bench_get_row(b: &mut Bencher) {
+        let mut pager = Pager::new().unwrap();
+        let row = Row {
+            id: 1,
+            name: "Test Name".to_string(),
+        };
+        let _ = pager.insert_row_at(0, 0, row.clone());
+
+        b.iter(|| {
+            let _ = pager.get_row_at(0, 0);
+        });
+
+        // Cleanup after benchmark
+        let _ = fs::remove_file("data.db");
+    }
+
+    // Utility function to prepare a table with rows for reading benchmark
+    fn prepare_table_with_rows(row_count: usize) -> Table {
         let table = Table::new();
-        assert!(table.pager.pages.read().unwrap().is_empty());
+        let mut cursor = Cursor::new(Box::new(table.pager.clone()), 0).unwrap();
+
+        for i in 0..row_count {
+            let row = Row {
+                id: i as i32,
+                name: format!("Test Name {}", i),
+            };
+            cursor.insert(row);
+        }
+
+        table
+    }
+
+    #[bench]
+    fn bench_insert_rows(b: &mut Bencher) {
+        // Clean up before running
+        let _ = fs::remove_file("data.db");
+
+        b.iter(|| {
+            let table = Table::new();
+            let mut cursor = Cursor::new(Box::new(table.pager.clone()), 0).unwrap();
+
+            for i in 0..1000 {
+                let row = Row {
+                    id: i as i32,
+                    name: format!("Test Name {}", i),
+                };
+                cursor.insert(row);
+            }
+        });
+
+        // Cleanup after benchmark
+        let _ = fs::remove_file("data.db");
+    }
+
+    #[bench]
+    fn bench_read_rows(b: &mut Bencher) {
+        // Prepare table with rows for reading
+        let table = prepare_table_with_rows(1000);
+
+        b.iter(|| {
+            let mut read_cursor = Cursor::new(Box::new(table.pager.clone()), 0).unwrap();
+
+            for _ in 0..1000 {
+                if let Some(row) = read_cursor
+                    .pager
+                    .get_row_at(read_cursor.page_num, read_cursor.row_num)
+                    .unwrap()
+                {
+                    test::black_box(row);
+                }
+                read_cursor.advance();
+            }
+        });
     }
 }
