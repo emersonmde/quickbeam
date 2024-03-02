@@ -21,6 +21,15 @@ enum Node {
     Internal(Internal),
 }
 
+impl Node {
+    fn get_row(&self, key: i32) -> Option<&Row> {
+        match self {
+            Node::Leaf(leaf) => leaf.get_row(key),
+            Node::Internal(_) => panic!("Internal nodes should not contain rows"),
+        }
+    }
+}
+
 type NodeId = usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,11 +40,34 @@ struct Leaf {
     next_leaf: Option<NodeId>,
 }
 
+impl Leaf {
+    fn get_row(&self, key: i32) -> Option<&Row> {
+        // Uses binary search to find partition point
+        self.values.get(self.values.partition_point(|v| v.id < key))
+    }
+
+    fn insert_row(&mut self, key: i32, row: Row) {
+        let idx = self.values.partition_point(|v| v.id < key);
+        self.values.insert(idx, row);
+    }
+
+    fn remove_row(&mut self, _key: i32) {
+        todo!("Implement remove_row")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Internal {
     parent_node: Option<NodeId>,
     size: usize,
-    children: Vec<NodeId>,
+    // (child_node_id, max_key)
+    children: Vec<(NodeId, i32)>,
+}
+
+impl Internal {
+    fn get_child_num(&self, key: i32) -> usize {
+        self.children.partition_point(|v| v.1 < key)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,9 +95,8 @@ impl Page {
     fn get_row(&self, key: i32) -> Option<&Row> {
         match &self.node {
             Node::Leaf(leaf) => {
-                // Uses binary search to find partition point
-                leaf.values.get(leaf.values.partition_point(|v| v.id < key))
-            },
+                leaf.get_row(key)
+            }
             Node::Internal(_) => {
                 panic!("Internal nodes should not contain rows")
             }
@@ -75,9 +106,8 @@ impl Page {
     fn insert_row(&mut self, key: i32, row: Row) {
         match &mut self.node {
             Node::Leaf(leaf) => {
-                let idx = leaf.values.partition_point(|v| v.id < key);
-                leaf.values.insert(idx, row);
-            },
+                leaf.insert_row(key, row)
+            }
             Node::Internal(_) => {
                 panic!("Internal nodes should not contain rows")
             }
@@ -85,8 +115,15 @@ impl Page {
     }
 
     // Use self.binary_search to find and remove row
-    fn remove_row(&mut self, _key: i32) {
-        todo!("Implement remove_row")
+    fn remove_row(&mut self, key: i32) {
+        match &mut self.node {
+            Node::Leaf(leaf) => {
+                leaf.remove_row(key)
+            }
+            Node::Internal(_) => {
+                panic!("Internal nodes should not contain rows")
+            }
+        }
     }
 }
 
@@ -139,6 +176,36 @@ impl Pager {
         }
         Ok(())
     }
+
+    fn find_page_by_key(&mut self, key: i32) -> Option<Page> {
+        let mut page_num = 0;
+        let mut page = self.get_page(page_num).unwrap();
+        let mut node = match &page.node {
+            Node::Leaf(_) => panic!("Root should be an internal node"),
+            Node::Internal(internal) => internal,
+        };
+    
+        loop {
+            let child_num = node.get_child_num(key);
+            page_num = node.children[child_num].0;
+            page = self.get_page(page_num).unwrap();
+            node = match &page.node {
+                Node::Leaf(_) => return Some(page.clone()),
+                Node::Internal(internal) => internal,
+            };
+        }
+    }
+
+    fn find_row_by_key(&mut self, key: i32) -> Option<Row> {
+        let page = self.find_page_by_key(key)?;
+        page.get_row(key).cloned()
+    }
+
+    fn insert_row(&mut self, key: i32, row: Row) {
+        let mut page = self.find_page_by_key(key).unwrap();
+        page.insert_row(key, row);
+        // TODO - Split page if necessary
+    }
 }
 
 #[derive(Debug)]
@@ -156,93 +223,37 @@ impl Table {
 
 struct Cursor {
     pager: Box<Pager>,
-    page_num: usize,
-    row_num: usize,
-    end_of_table: bool,
+    keys: Vec<i32>,
+    current_idx: usize,
 }
 
 impl Cursor {
-    fn new(pager: Box<Pager>, row_num: usize) -> Result<Self, io::Error> {
-        let page_num = row_num / ROWS_PER_PAGE;
-
+    fn new(mut pager: Box<Pager>, keys: Vec<i32>) -> Result<Self, io::Error> {
+        let current_idx = pager.get_page(0)?.node.get_row(keys[0]).is_some() as usize;
         Ok(Cursor {
             pager,
-            page_num,
-            row_num,
-            end_of_table: false,
+            keys,
+            current_idx
         })
     }
 
     fn advance(&mut self) {
-        self.row_num += 1;
-        let new_page_num = self.row_num / ROWS_PER_PAGE;
-
-        if new_page_num != self.page_num {
-            self.page_num = new_page_num;
-        }
+        self.current_idx += 1;
     }
 
     fn get_row(&mut self) -> Option<Row> {
-        let page = self.pager.get_page(self.page_num).expect("Failed to get page");
-        let row = page.get_row((self.row_num % ROWS_PER_PAGE).try_into().unwrap());
-        row.cloned()
+        self.pager.find_row_by_key(self.keys[self.current_idx])
     }
 
     fn insert(&mut self, row: Row) {
-        let page_num = self.row_num / ROWS_PER_PAGE;
-        let page = self.pager.get_page(page_num).expect("Failed to get page");
-        page.insert_row((self.row_num % ROWS_PER_PAGE).try_into().unwrap(), row);
+        let mut page = self.pager.find_page_by_key(self.keys[self.current_idx])
+            .expect("Unable to get page");
+        page.insert_row(self.keys[self.current_idx], row);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
     extern crate test;
-    use std::fs;
-    use test::Bencher;
-
-    fn setup_test_db() -> io::Result<Pager> {
-        let pager = Pager::new()?;
-        std::fs::remove_file("data.db").ok();
-        Ok(pager)
-    }
-
-    // Utility function to prepare a table with rows for reading benchmark
-    fn prepare_table_with_rows(row_count: usize) -> Table {
-        let table = Table::new();
-        let mut cursor = Cursor::new(Box::new(table.pager.clone()), 0).unwrap();
-
-        for i in 0..row_count {
-            let row = Row {
-                id: i as i32,
-                name: format!("Test Name {}", i),
-            };
-            cursor.insert(row);
-        }
-
-        table
-    }
-
-    #[bench]
-    fn bench_insert_rows(b: &mut Bencher) {
-        // Clean up before running
-        let _ = fs::remove_file("data.db");
-
-        b.iter(|| {
-            let table = Table::new();
-            let mut cursor = Cursor::new(Box::new(table.pager.clone()), 0).unwrap();
-
-            for i in 0..1000 {
-                let row = Row {
-                    id: i as i32,
-                    name: format!("Test Name {}", i),
-                };
-                cursor.insert(row);
-            }
-        });
-
-        // Cleanup after benchmark
-        let _ = fs::remove_file("data.db");
-    }
 }
