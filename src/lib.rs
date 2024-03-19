@@ -76,13 +76,23 @@ struct Page {
 }
 
 impl Page {
-    fn new() -> Self {
+    fn new_leaf() -> Self {
         Page {
             node: Node::Leaf(Leaf {
                 parent_node: None,
                 size: 0,
                 values: Vec::new(),
                 next_leaf: None,
+            }),
+        }
+    }
+
+    fn new_internal() -> Self {
+        Page {
+            node: Node::Internal(Internal {
+                parent_node: None,
+                size: 0,
+                children: Vec::new(),
             }),
         }
     }
@@ -94,9 +104,7 @@ impl Page {
 
     fn get_row(&self, key: i32) -> Option<&Row> {
         match &self.node {
-            Node::Leaf(leaf) => {
-                leaf.get_row(key)
-            }
+            Node::Leaf(leaf) => leaf.get_row(key),
             Node::Internal(_) => {
                 panic!("Internal nodes should not contain rows")
             }
@@ -105,9 +113,7 @@ impl Page {
 
     fn insert_row(&mut self, key: i32, row: Row) {
         match &mut self.node {
-            Node::Leaf(leaf) => {
-                leaf.insert_row(key, row)
-            }
+            Node::Leaf(leaf) => leaf.insert_row(key, row),
             Node::Internal(_) => {
                 panic!("Internal nodes should not contain rows")
             }
@@ -117,9 +123,7 @@ impl Page {
     // Use self.binary_search to find and remove row
     fn remove_row(&mut self, key: i32) {
         match &mut self.node {
-            Node::Leaf(leaf) => {
-                leaf.remove_row(key)
-            }
+            Node::Leaf(leaf) => leaf.remove_row(key),
             Node::Internal(_) => {
                 panic!("Internal nodes should not contain rows")
             }
@@ -184,7 +188,7 @@ impl Pager {
             Node::Leaf(_) => panic!("Root should be an internal node"),
             Node::Internal(internal) => internal,
         };
-    
+
         loop {
             let child_num = node.get_child_num(key);
             page_num = node.children[child_num].0;
@@ -205,6 +209,35 @@ impl Pager {
         let mut page = self.find_page_by_key(key).unwrap();
         page.insert_row(key, row);
         // TODO - Split page if necessary
+    }
+
+    fn split_leaf_node(&mut self, leaf_page_num: usize, parent_page_num: usize) {
+        let new_page_num = self.pages.len();
+        let page = self.get_page(leaf_page_num).unwrap();
+        let leaf = match &mut page.node {
+            Node::Leaf(leaf) => leaf,
+            Node::Internal(_) => panic!("Page should be a leaf node"),
+        };
+
+        let mut new_page = Page::new_leaf();
+        let new_leaf = match &mut new_page.node {
+            Node::Leaf(leaf) => leaf,
+            Node::Internal(_) => panic!("Page should be a leaf node"),
+        };
+
+        let split_point = leaf.size / 2;
+        new_leaf.values = leaf.values.split_off(split_point);
+        new_leaf.size = new_leaf.values.len();
+        leaf.size = leaf.values.len();
+
+        let parent_page = self.get_page(parent_page_num).unwrap();
+        let parent = match &mut parent_page.node {
+            Node::Leaf(_) => panic!("Page should be an internal node"),
+            Node::Internal(internal) => internal,
+        };
+
+        parent.children.push((new_page_num, new_leaf.values[0].id));
+        self.pages.insert(new_page_num, new_page);
     }
 }
 
@@ -233,7 +266,7 @@ impl Cursor {
         Ok(Cursor {
             pager,
             keys,
-            current_idx
+            current_idx,
         })
     }
 
@@ -246,7 +279,9 @@ impl Cursor {
     }
 
     fn insert(&mut self, row: Row) {
-        let mut page = self.pager.find_page_by_key(self.keys[self.current_idx])
+        let mut page = self
+            .pager
+            .find_page_by_key(self.keys[self.current_idx])
             .expect("Unable to get page");
         page.insert_row(self.keys[self.current_idx], row);
     }
